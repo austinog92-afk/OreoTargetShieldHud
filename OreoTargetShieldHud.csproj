@@ -59,6 +59,7 @@
     <Compile Include="DefenseShieldsApi.cs" />
     <Compile Include="Plugin.cs" />
     <Compile Include="RecordStore.cs" />
+    <Compile Include="RoachT3Bridge.cs" />
     <Compile Include="TextHudBridge.cs" />
     <Compile Include="WeaponCoreApi.cs" />
     <Compile Include="Properties\AssemblyInfo.cs" />

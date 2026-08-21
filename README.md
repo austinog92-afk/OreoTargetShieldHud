@@ -12,16 +12,28 @@ present on the server. Text HUD API is enabled locally through Pulsar.
 
 - exact current and maximum target shield HP
 - shield percent and an FPS-style color bar
+- selected target's current and highest-observed hull integrity with a second HP bar
 - target name and distance
 - live damage dealt to the selected target, split into shield and hull/block damage
-- floating current/maximum shield bars for up to eight nearby WC threats within 15 km
+- RPG-style floating damage numbers above hit NPCs: white for shield and red for hull
+- floating current/maximum shield bars for up to sixteen on-screen WC threats within 15 km
+- rolling shield drain/recharge rate with estimated time to break or full charge
 - highest maximum shield ever observed for that NPC name, saved locally
+- when the selected WC target matches the Roacher script's TRACK target: live T3
+  recovered, expected maximum, average, best, lifetime total, and tracked count
 
-The selected target polls at about 5 Hz and nearby shield values at about 2 Hz. The
-plugin performs no terminal/grid scans and uses no per-projectile monitor or firing
-callback. WeaponCore's aggregate damage callback is registered only while the HUD is
-enabled and a selected WC target exists, then it is immediately filtered to your
-controlled grid and that target.
+The selected shield target polls at about 5 Hz, nearby shield values at about 2 Hz,
+and only the selected grid's hull integrity at about 1 Hz. The plugin performs no
+repeated inventory scans and uses no per-projectile monitor or firing callback.
+The optional Roacher link discovers `RoachDataLCD` and the Roacher programmable
+block once, then samples their already-generated TRACK/T3 records at only 1 Hz.
+WeaponCore's aggregate damage callback is registered only while the HUD is enabled
+and a selected WC target exists, then it is immediately filtered to weapons fired by
+your controlled grid. Per-target totals remain keyed to the identified hit entity.
+
+Rapid-fire and multi-projectile damage is combined into short 0.2-second batches
+before drawing. This keeps MAC subprojectiles and automatic weapons readable and
+caps the HUD at ten simultaneous damage numbers without adding another callback.
 
 ## Build (Pulsar Legacy / Space Engineers 1)
 
@@ -53,12 +65,15 @@ Commands are intercepted locally and are not sent to server chat.
 | `/oshield on` / `/oshield off` | Explicit overlay state |
 | `/oshield bars` | Toggle nearby enemy shield bars |
 | `/oshield bars on` / `/oshield bars off` | Explicit nearby-bar state |
-| `/oshield bars min` | One-line name, segmented bar, and percent; also enables bars |
-| `/oshield bars full` | Two-line full name, percent, current HP, and maximum HP; also enables bars |
+| `/oshield bars min` | Compact segmented bar and percent beside the WC target tag; also enables bars |
+| `/oshield bars full` | Two-line bar, percent, current HP, and maximum HP beside the WC target tag; also enables bars |
+| `/oshield names` | Toggle the plugin's NPC names; useful when WC labels are hidden |
+| `/oshield names on` / `/oshield names off` | Explicit floating-name state |
 | `/oshield resetdamage` | Reset the current target's live damage counters |
 | `/oshield pos -0.34 0.82` | Set screen coordinates (-1 to 1) |
+| `/oshield resetpos` | Restore the default HUD position |
 | `/oshield scale 0.78` | Set text scale (0.4 to 2.0) |
-| `/oshield api` | Show WC / DS / TextHUD connection state |
+| `/oshield api` | Show WC / DS / Roach T3 / TextHUD connection state |
 | `/oshield record` | Show current target's highest observed maximum |
 | `/oshield top` | Show five largest locally recorded NPC shields |
 | `/oshield save` | Immediately save all maximum-shield records and report the count |
@@ -70,12 +85,26 @@ Commands are intercepted locally and are not sent to server chat.
 
 - Records are keyed by the target's displayed grid name. Repeated NPCs with the same
   name continue the same maximum record.
-- Generic debris names `Large Grid`, `Static Grid`, and their numbered variants are
-  ignored. Old generic-name records are automatically purged when the plugin loads.
-- Nearby threat bars also feed the maximum-shield records, so an NPC does not have to
-  be your selected focus to update its highest observed capacity.
-- Minimal bars are the default. They remove the leading `(NPC-FACTION)` tag and use
-  a compact four-to-eight-cell stepped `▁▂▃▄▅▆▇█` shield bar from the programmable-block HUD.
+- Roach T3 integration is automatic when the controlled ship has an LCD named
+  `RoachDataLCD` and the Oreo Roacher PB. The plugin reads the PB's existing
+  `T3STAT`/`T3RUN` records and the LCD's live `TRACK:` line; it never scans cargo.
+  The T3 card appears only when that TRACK target matches the current WC target.
+- Generic debris names beginning with `Large Grid` or `Static Grid`, including
+  numbered or formatted variants, are excluded from the selected-target display,
+  nearby bars, and saved records. Old generic-name records are automatically purged
+  when the plugin loads.
+- On-screen nearby threat bars also feed the maximum-shield records, so an NPC does
+  not have to be your selected focus to update its highest observed capacity.
+- Nearby bars prioritize visible threats before using one of the sixteen slots.
+- Shield rate is calculated from the existing selected-target samples. A maximum-
+  capacity change resets the rate baseline, preventing fortify/unfortify transitions
+  from appearing as shield drain or recharge.
+- Minimal bars are the default. WeaponCore already supplies the NPC name, so floating
+  bars only draw a compact four-to-eight-cell stepped `▁▂▃▄▅▆▇█` shield bar and percent.
+  They sit just above and to the right of the WC tag, move farther right for longer names,
+  and flip to the left near the screen edge.
+  Run `/oshield names on` when WeaponCore labels are hidden; this brings back the compact
+  plugin name and centers the complete name/bar tag over the NPC. The setting is saved.
   Bar width uses a logarithmic scale between the weakest and strongest nearby
   shields currently displayed. This keeps small, medium, and capital-class shield
   differences readable even when their capacities are orders of magnitude apart.
@@ -97,8 +126,13 @@ Commands are intercepted locally and are not sent to server chat.
   construct entity. This handles cases where WC's construct root differs from the
   controlled cockpit grid while still rejecting other players' damage.
 - The floating bars are shield HP bars, not whole-grid structural HP. Space Engineers
-  does not expose one reliable combined hull-HP value for a grid. Unshielded threats
-  therefore do not receive a floating bar.
+  does not expose one precomputed combined hull-HP value for a grid. The selected
+  target's hull bar therefore sums the integrity of its existing blocks once per
+  second and keeps the highest observed maximum for that entity. Unshielded nearby
+  threats do not receive a floating bar.
+- A block destroyed before the plugin first observes a target cannot be reconstructed
+  from client data, so the hull maximum is the highest total observed after selection.
+  Once observed, destroyed blocks do not shrink that target's cached maximum.
 - Fortification can increase shield capacity. Because the requested statistic is the
   highest observed maximum shield, a fortified maximum becomes the saved record.
 - If the overlay says it is waiting, run `/oshield api`. Verify all three APIs are
