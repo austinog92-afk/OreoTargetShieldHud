@@ -14,5 +14,5 @@ Requires WeaponCore and Defense Shields on the server. Enable the Text HUD API c
     <Directory>.</Directory>
   </SourceDirectories>
   <Hidden>false</Hidden>
-  <Commit>REPLACE_WITH_FULL_GITHUB_COMMIT_HASH</Commit>
+  <Commit>40af2dc5a625026586f3a206a9374800fd39fedf</Commit>
 </PluginData>
