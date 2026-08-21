@@ -14,17 +14,24 @@ namespace Oreo.TargetShieldHud
 {
     /// <summary>
     /// Pulsar client plugin. Shows the local player's WeaponCore focus, live
-    /// Defense Shields values, outgoing WC damage, and a capped set of nearby
-    /// enemy shield bars. Only maximum observed NPC shield capacity is saved.
+    /// Defense Shields values, selected-grid hull integrity, outgoing WC damage
+    /// popups, and a capped set of nearby enemy shield bars. Only maximum observed
+    /// NPC shield capacity is saved permanently.
     /// </summary>
     public sealed class Plugin : IPlugin, IDisposable
     {
         private const int PollFrames = 12;        // Selected target: about 5 reads/second.
         private const int ThreatPollFrames = 30; // Nearby bars: about 2 reads/second.
+        private const int HullPollFrames = 60;   // Selected hull: one local scan/second.
         private const int ApiRetryFrames = 300;  // Re-request missing APIs every ~5 seconds.
         private const int SaveFrames = 600;      // At most one local save every ~10 seconds.
-        private const int MaxEnemyBars = 8;
+        private const int MaxEnemyBars = 16;
         private const int MaxDamageTargets = 128;
+        private const int MaxHullTargets = 64;
+        private const int DamagePopupBatchFrames = 12;
+        private const int DamagePopupLifetimeFrames = 72;
+        private const int MaxDamagePopups = 10;
+        private const int MaxPendingDamageTargets = 16;
         private const double EnemyBarRange = 15000d;
         private const long DamageMonitorId = 675497565490103L;
         private static readonly char[] ShieldBarSteps =
@@ -32,13 +39,21 @@ namespace Oreo.TargetShieldHud
 
         private readonly StringBuilder hudText = new StringBuilder(480);
         private readonly RecordStore records = new RecordStore();
+        private readonly RoachT3Bridge roachT3 = new RoachT3Bridge();
         private readonly List<MyTuple<MyEntity, float>> threats =
             new List<MyTuple<MyEntity, float>>(32);
         private readonly Dictionary<long, EnemyShieldBar> enemyBars =
             new Dictionary<long, EnemyShieldBar>();
         private readonly Dictionary<long, TargetDamageRecord> damageByTarget =
             new Dictionary<long, TargetDamageRecord>();
+        private readonly Dictionary<long, TargetHullRecord> hullByTarget =
+            new Dictionary<long, TargetHullRecord>();
+        private readonly Dictionary<long, PendingDamageBatch> pendingDamagePopups =
+            new Dictionary<long, PendingDamageBatch>();
+        private readonly List<DamagePopup> damagePopups = new List<DamagePopup>(MaxDamagePopups);
+        private readonly List<IMySlimBlock> hullBlocks = new List<IMySlimBlock>(4096);
         private readonly List<long> staleBarIds = new List<long>(16);
+        private readonly List<long> readyPopupIds = new List<long>(MaxPendingDamageTargets);
         private readonly List<EnemyShieldSample> shieldSamples =
             new List<EnemyShieldSample>(MaxEnemyBars);
         private readonly Action<ListReader<MyTuple<ulong, long, int, MyEntity, MyEntity,
@@ -52,11 +67,20 @@ namespace Oreo.TargetShieldHud
         private bool damageMonitorActive;
         private int frame;
         private int lastSaveFrame;
+        private int damagePopupSequence;
         private long shooterGridId;
         private long currentTargetId;
         private string currentTargetName = string.Empty;
         private TargetDamageRecord currentDamage;
+        private IMyCubeGrid shooterGrid;
+        private IMyCubeGrid currentTargetGrid;
+        private TargetHullRecord currentHull;
         private double currentMaxSeen;
+        private double previousShieldHp;
+        private double previousShieldMaximum;
+        private double shieldRateHpPerSecond;
+        private int previousShieldFrame;
+        private bool shieldRateReady;
 
         public Plugin()
         {
@@ -100,6 +124,8 @@ namespace Oreo.TargetShieldHud
                 if (records.Enabled && records.EnemyBars)
                     UpdateEnemyBarPositions();
 
+                UpdateDamagePopups();
+
                 if (records.Dirty && frame - lastSaveFrame >= SaveFrames)
                 {
                     records.Save();
@@ -134,6 +160,7 @@ namespace Oreo.TargetShieldHud
         {
             SetDamageMonitoring(false);
             ClearEnemyBars();
+            ClearDamagePopups();
             if (records.Dirty && MyAPIGateway.Utilities != null)
                 records.Save();
             if (MyAPIGateway.Utilities != null)
@@ -149,6 +176,9 @@ namespace Oreo.TargetShieldHud
             hudText.Clear();
             ClearCurrentTarget(false);
             damageByTarget.Clear();
+            hullByTarget.Clear();
+            hullBlocks.Clear();
+            roachT3.Reset();
             sessionLoaded = false;
         }
 
@@ -205,9 +235,16 @@ namespace Oreo.TargetShieldHud
             string targetName = CleanHudText(target.DisplayName);
             if (string.IsNullOrWhiteSpace(targetName))
                 targetName = "Entity " + target.EntityId;
+            if (RecordStore.IsGenericGridName(targetName))
+            {
+                ClearCurrentTarget(true);
+                hudText.Append("<color=90,90,90>OREO TARGET SHIELD - ignored unnamed grid<color=255,255,255>");
+                return;
+            }
 
             IMyTerminalBlock shield = defenseShields.FindShield(target);
             SetCurrentTarget(shooter, target, targetName);
+            RefreshHullIntegrityIfDue();
 
             double distance = Vector3D.Distance(shooter.PositionComp.WorldAABB.Center,
                 target.PositionComp.WorldAABB.Center);
@@ -217,8 +254,11 @@ namespace Oreo.TargetShieldHud
 
             if (shield == null)
             {
+                ResetShieldRate();
                 hudText.Append("<color=150,150,150>SHIELD: none detected<color=255,255,255>");
+                AppendHullBar();
                 AppendDamageLine();
+                AppendRoachT3();
                 return;
             }
 
@@ -229,8 +269,11 @@ namespace Oreo.TargetShieldHud
             double percent = defenseShields.GetPercent(shield);
             if (maximumHp <= 0)
             {
+                ResetShieldRate();
                 hudText.Append("<color=150,150,150>SHIELD: API returned no capacity<color=255,255,255>");
+                AppendHullBar();
                 AppendDamageLine();
+                AppendRoachT3();
                 return;
             }
             if (percent < 0 || double.IsNaN(percent) || double.IsInfinity(percent))
@@ -238,6 +281,7 @@ namespace Oreo.TargetShieldHud
             percent = ClampPercent(percent);
 
             currentMaxSeen = records.Observe(currentTargetName, maximumHp);
+            UpdateShieldRate(currentHp, maximumHp);
             string color = PercentColor(percent);
             hudText.Append("<color=0,220,255>SHIELD:<color=255,255,255> ")
                 .Append(FormatNumber(currentHp)).Append(" / ")
@@ -251,17 +295,25 @@ namespace Oreo.TargetShieldHud
                 hudText.Append("  <color=0,220,255>MAX SEEN:<color=255,255,255> ")
                     .Append(FormatNumber(currentMaxSeen));
 
+            AppendHullBar();
+            AppendShieldRate(currentHp, maximumHp);
             AppendDamageLine();
+            AppendRoachT3();
         }
 
         private void SetCurrentTarget(MyEntity shooter, MyEntity target, string name)
         {
             long newShooterId = shooter == null ? 0 : shooter.EntityId;
             long newTargetId = target == null ? 0 : target.EntityId;
+            if (newTargetId != currentTargetId)
+                ResetShieldRate();
             shooterGridId = newShooterId;
+            shooterGrid = shooter as IMyCubeGrid;
             currentTargetId = newTargetId;
             currentTargetName = name ?? string.Empty;
             currentDamage = GetOrCreateDamageRecord(currentTargetId, currentTargetName);
+            currentTargetGrid = target as IMyCubeGrid;
+            currentHull = GetOrCreateHullRecord(currentTargetId);
             currentMaxSeen = records.GetMaximumSeen(currentTargetName);
             SetDamageMonitoring(currentTargetId != 0);
         }
@@ -271,10 +323,203 @@ namespace Oreo.TargetShieldHud
             if (stopDamageMonitor)
                 SetDamageMonitoring(false);
             shooterGridId = 0;
+            shooterGrid = null;
             currentTargetId = 0;
             currentTargetName = string.Empty;
             currentDamage = null;
+            currentTargetGrid = null;
+            currentHull = null;
             currentMaxSeen = 0;
+            hullBlocks.Clear();
+            ResetShieldRate();
+        }
+
+        private TargetHullRecord GetOrCreateHullRecord(long entityId)
+        {
+            if (entityId == 0)
+                return null;
+
+            TargetHullRecord record;
+            if (!hullByTarget.TryGetValue(entityId, out record))
+            {
+                if (hullByTarget.Count >= MaxHullTargets)
+                {
+                    long oldestId = 0;
+                    int oldestFrame = int.MaxValue;
+                    foreach (KeyValuePair<long, TargetHullRecord> item in hullByTarget)
+                    {
+                        if (item.Key != currentTargetId &&
+                            item.Value.LastScanFrame < oldestFrame)
+                        {
+                            oldestId = item.Key;
+                            oldestFrame = item.Value.LastScanFrame;
+                        }
+                    }
+                    if (oldestId != 0)
+                        hullByTarget.Remove(oldestId);
+                }
+
+                record = new TargetHullRecord();
+                hullByTarget[entityId] = record;
+            }
+            return record;
+        }
+
+        private void RefreshHullIntegrityIfDue()
+        {
+            if (currentTargetGrid == null || currentHull == null ||
+                currentTargetGrid.MarkedForClose)
+                return;
+            if (currentHull.LastScanFrame > 0 &&
+                frame - currentHull.LastScanFrame < HullPollFrames)
+                return;
+
+            try
+            {
+                hullBlocks.Clear();
+                currentTargetGrid.GetBlocks(hullBlocks);
+                double currentHp = 0;
+                double existingMaximumHp = 0;
+                for (int i = 0; i < hullBlocks.Count; i++)
+                {
+                    IMySlimBlock block = hullBlocks[i];
+                    if (block == null)
+                        continue;
+                    double maximum = Math.Max(0, block.MaxIntegrity);
+                    existingMaximumHp += maximum;
+                    currentHp += Math.Max(0, Math.Min(maximum, block.Integrity));
+                }
+
+                if (existingMaximumHp <= 0)
+                    return;
+
+                // Never reduce the denominator when a destroyed block disappears
+                // from the grid. New/rebuilt blocks may increase the observed peak.
+                if (existingMaximumHp > currentHull.MaximumHp)
+                    currentHull.MaximumHp = existingMaximumHp;
+                currentHull.CurrentHp = Math.Min(currentHp, currentHull.MaximumHp);
+                currentHull.LastScanFrame = frame;
+                currentHull.Ready = true;
+            }
+            catch
+            {
+                // A grid can close while blocks are being copied. Keep the previous
+                // good reading and try again on the next selected-target scan.
+            }
+            finally
+            {
+                hullBlocks.Clear();
+            }
+        }
+
+        private void AppendHullBar()
+        {
+            hudText.Append("\n<color=0,220,255>HULL:<color=255,255,255> ");
+            if (currentHull == null || !currentHull.Ready ||
+                currentHull.MaximumHp <= 0)
+            {
+                hudText.Append("calculating");
+                return;
+            }
+
+            double percent = ClampPercent(100d * currentHull.CurrentHp /
+                currentHull.MaximumHp);
+            string color = PercentColor(percent);
+            hudText.Append(FormatNumber(currentHull.CurrentHp)).Append(" / ")
+                .Append(FormatNumber(currentHull.MaximumHp)).Append(" HP  ")
+                .Append("<color=").Append(color).Append(">")
+                .Append(percent.ToString("0.0", CultureInfo.InvariantCulture))
+                .Append("%<color=255,255,255>\n")
+                .Append(BuildBar(percent, color));
+        }
+
+        private void ResetShieldRate()
+        {
+            previousShieldHp = 0;
+            previousShieldMaximum = 0;
+            shieldRateHpPerSecond = 0;
+            previousShieldFrame = 0;
+            shieldRateReady = false;
+        }
+
+        private void UpdateShieldRate(double currentHp, double maximumHp)
+        {
+            if (previousShieldFrame <= 0)
+            {
+                previousShieldHp = currentHp;
+                previousShieldMaximum = maximumHp;
+                previousShieldFrame = frame;
+                shieldRateReady = false;
+                return;
+            }
+
+            double elapsed = (frame - previousShieldFrame) / 60d;
+            // Capacity should be effectively constant between samples. A fortify,
+            // unfortify, or modulation transition changes maximum HP, so start a
+            // fresh baseline rather than reporting the capacity change as damage.
+            double capacityTolerance = Math.Max(10d,
+                Math.Max(previousShieldMaximum, maximumHp) * 0.0001d);
+            bool stableCapacity = Math.Abs(maximumHp - previousShieldMaximum) <=
+                capacityTolerance;
+
+            if (!stableCapacity || elapsed <= 0 || elapsed > 2d)
+            {
+                previousShieldHp = currentHp;
+                previousShieldMaximum = maximumHp;
+                previousShieldFrame = frame;
+                shieldRateHpPerSecond = 0;
+                shieldRateReady = false;
+                return;
+            }
+
+            double delta = currentHp - previousShieldHp;
+            double noiseFloor = Math.Max(1d, maximumHp * 0.000001d);
+            double rawRate = Math.Abs(delta) <= noiseFloor ? 0 : delta / elapsed;
+            double rateNoiseFloor = noiseFloor / elapsed;
+
+            if (!shieldRateReady ||
+                (rawRate != 0 &&
+                    Math.Sign(rawRate) != Math.Sign(shieldRateHpPerSecond)))
+                shieldRateHpPerSecond = rawRate;
+            else
+                shieldRateHpPerSecond = shieldRateHpPerSecond * 0.65d + rawRate * 0.35d;
+
+            if (Math.Abs(shieldRateHpPerSecond) < rateNoiseFloor)
+                shieldRateHpPerSecond = 0;
+
+            previousShieldHp = currentHp;
+            previousShieldMaximum = maximumHp;
+            previousShieldFrame = frame;
+            shieldRateReady = true;
+        }
+
+        private void AppendShieldRate(double currentHp, double maximumHp)
+        {
+            hudText.Append("\n<color=0,220,255>SHIELD RATE:<color=255,255,255> ");
+            if (!shieldRateReady)
+            {
+                hudText.Append("calculating");
+                return;
+            }
+
+            if (shieldRateHpPerSecond < 0)
+            {
+                double rate = -shieldRateHpPerSecond;
+                hudText.Append("<color=255,80,80>DRAIN<color=255,255,255> ")
+                    .Append(FormatNumber(rate)).Append("/s  |  BREAK ~")
+                    .Append(FormatDuration(currentHp / rate));
+            }
+            else if (shieldRateHpPerSecond > 0)
+            {
+                double remaining = Math.Max(0, maximumHp - currentHp);
+                hudText.Append("<color=80,255,120>RECHARGE<color=255,255,255> ")
+                    .Append(FormatNumber(shieldRateHpPerSecond)).Append("/s  |  FULL ~")
+                    .Append(FormatDuration(remaining / shieldRateHpPerSecond));
+            }
+            else
+            {
+                hudText.Append("stable");
+            }
         }
 
         private void AppendDamageLine()
@@ -288,6 +533,35 @@ namespace Oreo.TargetShieldHud
                 .Append(FormatNumber(shieldDamage))
                 .Append("  <color=255,170,60>HULL:<color=255,255,255> ")
                 .Append(FormatNumber(hullDamage));
+        }
+
+        private void AppendRoachT3()
+        {
+            T3Snapshot t3 = roachT3.Read(shooterGrid, currentTargetId,
+                currentTargetName, frame);
+            if (t3 == null || !t3.Available || !t3.MatchesSelectedTarget)
+                return;
+
+            hudText.Append("\n<color=0,220,255>ROACH T3:<color=255,255,255> ")
+                .Append(t3.Active
+                    ? "<color=0,255,80>TRACKING<color=255,255,255> "
+                    : "<color=255,220,0>PAUSED<color=255,255,255> ")
+                .Append(FormatT3(t3.Current));
+            if (t3.ExpectedMaximum > 0)
+            {
+                hudText.Append(" / ").Append(FormatT3(t3.ExpectedMaximum))
+                    .Append(" (").Append((100d * t3.Current / t3.ExpectedMaximum)
+                        .ToString("0", CultureInfo.InvariantCulture)).Append("%)");
+            }
+
+            hudText.Append("\n<color=0,220,255>AVG<color=255,255,255> ")
+                .Append(t3.Tracked > 0 ? FormatT3(t3.Average) : "--")
+                .Append("  <color=0,220,255>BEST<color=255,255,255> ")
+                .Append(FormatT3(t3.Best))
+                .Append("  <color=0,220,255>TOTAL<color=255,255,255> ")
+                .Append(FormatT3(t3.Total))
+                .Append("  <color=0,220,255>TRACKED<color=255,255,255> ")
+                .Append(t3.Tracked.ToString(CultureInfo.InvariantCulture));
         }
 
         private void SetDamageMonitoring(bool enabled)
@@ -351,6 +625,8 @@ namespace Oreo.TargetShieldHud
                             record.Hull += damage;
                             record.LastSeenFrame = frame;
                         }
+                        if (hitTop != null)
+                            QueueDamagePopup(hitTop, damage, false);
                         continue;
                     }
 
@@ -366,8 +642,189 @@ namespace Oreo.TargetShieldHud
                         shieldRecord.Shield += damage;
                         shieldRecord.LastSeenFrame = frame;
                     }
+                    QueueDamagePopup(hitEntity, damage, true);
                 }
             }
+        }
+
+        private void QueueDamagePopup(MyEntity entity, double damage, bool shieldDamage)
+        {
+            if (entity == null || entity.MarkedForClose || damage <= 0 ||
+                double.IsNaN(damage) || double.IsInfinity(damage))
+                return;
+
+            entity = entity.GetTopMostParent() ?? entity;
+            PendingDamageBatch batch;
+            if (!pendingDamagePopups.TryGetValue(entity.EntityId, out batch))
+            {
+                if (pendingDamagePopups.Count >= MaxPendingDamageTargets)
+                    return;
+                // Check the name once when opening a batch, not once per projectile.
+                // A MAC can report hundreds of damage samples for one visible hit.
+                string name = CleanHudText(entity.DisplayName);
+                if (RecordStore.IsGenericGridName(name))
+                    return;
+                batch = new PendingDamageBatch
+                {
+                    Entity = entity,
+                    FirstFrame = frame
+                };
+                pendingDamagePopups[entity.EntityId] = batch;
+            }
+            else
+            {
+                batch.Entity = entity;
+            }
+
+            if (shieldDamage)
+                batch.ShieldDamage += damage;
+            else
+                batch.HullDamage += damage;
+        }
+
+        private void UpdateDamagePopups()
+        {
+            if (!records.Enabled || textHud == null || !textHud.IsReady)
+            {
+                ClearDamagePopups();
+                return;
+            }
+
+            readyPopupIds.Clear();
+            foreach (KeyValuePair<long, PendingDamageBatch> item in pendingDamagePopups)
+            {
+                PendingDamageBatch batch = item.Value;
+                if (batch.Entity == null || batch.Entity.MarkedForClose ||
+                    frame - batch.FirstFrame >= DamagePopupBatchFrames)
+                    readyPopupIds.Add(item.Key);
+            }
+
+            for (int i = 0; i < readyPopupIds.Count; i++)
+            {
+                PendingDamageBatch batch;
+                if (!pendingDamagePopups.TryGetValue(readyPopupIds[i], out batch))
+                    continue;
+                pendingDamagePopups.Remove(readyPopupIds[i]);
+                if (batch.Entity == null || batch.Entity.MarkedForClose)
+                    continue;
+                SpawnDamagePopup(batch.Entity, batch.ShieldDamage, true);
+                SpawnDamagePopup(batch.Entity, batch.HullDamage, false);
+            }
+            readyPopupIds.Clear();
+
+            if (MyAPIGateway.Session == null || MyAPIGateway.Session.Camera == null)
+            {
+                SetDamagePopupsVisible(false);
+                return;
+            }
+
+            var camera = MyAPIGateway.Session.Camera;
+            for (int i = damagePopups.Count - 1; i >= 0; i--)
+            {
+                DamagePopup popup = damagePopups[i];
+                int ageFrames = frame - popup.StartFrame;
+                if (ageFrames >= DamagePopupLifetimeFrames || popup.Entity == null ||
+                    popup.Entity.MarkedForClose)
+                {
+                    if (popup.Line != null) popup.Line.Dispose();
+                    damagePopups.RemoveAt(i);
+                    continue;
+                }
+
+                Vector3D position = popup.Entity.PositionComp.WorldAABB.Center;
+                Vector3D viewPosition = Vector3D.Transform(position, camera.ViewMatrix);
+                if (viewPosition.Z >= 0)
+                {
+                    popup.Line.SetVisible(false);
+                    continue;
+                }
+
+                Vector3D screenPosition = camera.WorldToScreen(ref position);
+                if (screenPosition.X < -1.15 || screenPosition.X > 1.15 ||
+                    screenPosition.Y < -1.15 || screenPosition.Y > 1.15)
+                {
+                    popup.Line.SetVisible(false);
+                    continue;
+                }
+
+                double progress = Math.Max(0, Math.Min(1,
+                    ageFrames / (double)DamagePopupLifetimeFrames));
+                UpdateDamagePopupText(popup, progress);
+                double horizontalOffset = (popup.Lane - 2) * 0.018d;
+                double verticalOffset = 0.10d + progress * 0.11d +
+                    (popup.Lane % 2) * 0.012d;
+                popup.Line.SetOrigin(new Vector2D(screenPosition.X + horizontalOffset,
+                    screenPosition.Y + verticalOffset));
+                popup.Line.SetVisible(true);
+            }
+        }
+
+        private void SpawnDamagePopup(MyEntity entity, double damage, bool shieldDamage)
+        {
+            if (entity == null || damage <= 0 || textHud == null || !textHud.IsReady)
+                return;
+
+            while (damagePopups.Count >= MaxDamagePopups)
+            {
+                DamagePopup oldest = damagePopups[0];
+                if (oldest.Line != null) oldest.Line.Dispose();
+                damagePopups.RemoveAt(0);
+            }
+
+            var popup = new DamagePopup
+            {
+                Entity = entity,
+                Damage = damage,
+                ShieldDamage = shieldDamage,
+                StartFrame = frame,
+                Lane = damagePopupSequence++ % 5
+            };
+            UpdateDamagePopupText(popup, 0);
+            popup.Line = textHud.CreateText(popup.Text, Vector2D.Zero,
+                Math.Max(0.55d, Math.Min(1.10d, records.Scale * 0.95d)));
+            if (popup.Line != null)
+                damagePopups.Add(popup);
+        }
+
+        private static void UpdateDamagePopupText(DamagePopup popup, double progress)
+        {
+            int red;
+            int green;
+            int blue;
+            if (popup.ShieldDamage)
+            {
+                red = green = blue = (int)Math.Round(255d - 140d * progress);
+            }
+            else
+            {
+                red = (int)Math.Round(255d - 110d * progress);
+                green = blue = (int)Math.Round(70d - 45d * progress);
+            }
+
+            popup.Text.Clear().Append("<color=").Append(red).Append(",")
+                .Append(green).Append(",").Append(blue).Append(">-")
+                .Append(FormatNumber(popup.Damage));
+        }
+
+        private void SetDamagePopupsVisible(bool visible)
+        {
+            for (int i = 0; i < damagePopups.Count; i++)
+            {
+                if (damagePopups[i].Line != null)
+                    damagePopups[i].Line.SetVisible(visible);
+            }
+        }
+
+        private void ClearDamagePopups()
+        {
+            for (int i = 0; i < damagePopups.Count; i++)
+            {
+                if (damagePopups[i].Line != null)
+                    damagePopups[i].Line.Dispose();
+            }
+            damagePopups.Clear();
+            pendingDamagePopups.Clear();
+            readyPopupIds.Clear();
         }
 
         private TargetDamageRecord GetOrCreateDamageRecord(long entityId, string name)
@@ -440,6 +897,14 @@ namespace Oreo.TargetShieldHud
                     Vector3D.DistanceSquared(shooterPosition,
                         target.PositionComp.WorldAABB.Center) > maxDistanceSquared)
                     continue;
+                if (!IsEntityOnScreen(target))
+                    continue;
+
+                string name = CleanHudText(target.DisplayName);
+                if (string.IsNullOrWhiteSpace(name))
+                    name = "Entity " + target.EntityId;
+                if (RecordStore.IsGenericGridName(name))
+                    continue;
 
                 IMyTerminalBlock shield = defenseShields.FindShield(target);
                 if (shield == null)
@@ -455,9 +920,6 @@ namespace Oreo.TargetShieldHud
                     percent = 100d * currentHp / maximumHp;
                 percent = ClampPercent(percent);
 
-                string name = CleanHudText(target.DisplayName);
-                if (string.IsNullOrWhiteSpace(name))
-                    name = "Entity " + target.EntityId;
                 records.Observe(name, maximumHp);
 
                 shieldSamples.Add(new EnemyShieldSample
@@ -513,23 +975,27 @@ namespace Oreo.TargetShieldHud
                 bar.Text.Clear();
                 if (records.MinimalEnemyBars)
                 {
-                    bar.Text.Append("<color=255,255,255>")
-                        .Append(CompactTargetName(name)).Append("  ")
-                        .Append(BuildShieldBar(percent, color, barWidth)).Append("  ")
+                    bar.Text.Append("<color=255,255,255>");
+                    if (records.ShowEnemyBarNames)
+                        bar.Text.Append(CompactTargetName(name)).Append("  ");
+                    bar.Text.Append(BuildShieldBar(percent, color, barWidth)).Append("  ")
                         .Append("<color=").Append(color).Append(">")
                         .Append(percent.ToString("0", CultureInfo.InvariantCulture))
                         .Append("%<color=255,255,255>");
                 }
                 else
                 {
-                    bar.Text.Append("<color=255,255,255>").Append(name).Append("  ")
+                    bar.Text.Append("<color=255,255,255>");
+                    if (records.ShowEnemyBarNames)
+                        bar.Text.Append(name).Append("\n");
+                    bar.Text.Append(BuildShieldBar(percent, color, barWidth)).Append("  ")
                         .Append("<color=").Append(color).Append(">")
                         .Append(percent.ToString("0", CultureInfo.InvariantCulture))
                         .Append("%<color=255,255,255>\n")
-                        .Append(BuildShieldBar(percent, color, barWidth)).Append("  ")
                         .Append(FormatNumber(currentHp)).Append(" / ")
                         .Append(FormatNumber(maximumHp)).Append(" HP");
                 }
+                bar.TagCharacters = Math.Max(8, Math.Min(32, name.Length));
                 bar.LastSeenFrame = frame;
             }
 
@@ -548,6 +1014,23 @@ namespace Oreo.TargetShieldHud
             }
 
             UpdateEnemyBarPositions();
+        }
+
+        private static bool IsEntityOnScreen(MyEntity entity)
+        {
+            if (entity == null || MyAPIGateway.Session == null ||
+                MyAPIGateway.Session.Camera == null)
+                return false;
+
+            var camera = MyAPIGateway.Session.Camera;
+            Vector3D position = entity.PositionComp.WorldAABB.Center;
+            Vector3D viewPosition = Vector3D.Transform(position, camera.ViewMatrix);
+            if (viewPosition.Z >= 0)
+                return false;
+
+            Vector3D screenPosition = camera.WorldToScreen(ref position);
+            return screenPosition.X >= -1.15 && screenPosition.X <= 1.15 &&
+                screenPosition.Y >= -1.15 && screenPosition.Y <= 1.15;
         }
 
         private void UpdateEnemyBarPositions()
@@ -582,8 +1065,25 @@ namespace Oreo.TargetShieldHud
                     continue;
                 }
 
-                bar.Line.SetOrigin(new Vector2D(screenPosition.X - 0.075,
-                    screenPosition.Y + 0.055));
+                double estimatedWidth = records.MinimalEnemyBars ? 0.20 : 0.27;
+                double originX;
+                if (records.ShowEnemyBarNames)
+                {
+                    // Name fallback: keep our complete tag close to the entity.
+                    estimatedWidth += Math.Min(0.24, bar.TagCharacters * 0.006);
+                    originX = screenPosition.X - estimatedWidth * 0.5;
+                }
+                else
+                {
+                    // WeaponCore supplies the name, so attach the bar to its right edge.
+                    double horizontalOffset = 0.15 + bar.TagCharacters * 0.006;
+                    originX = screenPosition.X + horizontalOffset;
+                    if (originX + estimatedWidth > 1.0)
+                        originX = screenPosition.X - horizontalOffset - estimatedWidth;
+                }
+
+                bar.Line.SetOrigin(new Vector2D(originX,
+                    screenPosition.Y + (records.MinimalEnemyBars ? 0.095 : 0.125)));
                 bar.Line.SetVisible(true);
             }
         }
@@ -660,6 +1160,19 @@ namespace Oreo.TargetShieldHud
                     ? (records.MinimalEnemyBars ? "MIN" : "FULL")
                     : "OFF"));
             }
+            else if (command == "names")
+            {
+                string state = parts.Length >= 3 ? parts[2].ToLowerInvariant() : "toggle";
+                if (state != "on" && state != "off" && state != "toggle")
+                {
+                    Notify("Use: /oshield names [on|off]", "Red");
+                    return;
+                }
+                records.ShowEnemyBarNames = state == "on" ||
+                    (state == "toggle" && !records.ShowEnemyBarNames);
+                records.MarkSettingsChanged();
+                Notify("Enemy bar names " + (records.ShowEnemyBarNames ? "ON" : "OFF"));
+            }
             else if (command == "resetdamage")
             {
                 if (currentDamage == null)
@@ -689,6 +1202,13 @@ namespace Oreo.TargetShieldHud
                 }
                 else Notify("Use: /oshield pos -0.34 0.82", "Red");
             }
+            else if (command == "resetpos")
+            {
+                records.ResetPosition();
+                if (hudLine != null)
+                    hudLine.SetOrigin(new Vector2D(records.X, records.Y));
+                Notify("HUD position reset to default", "Green", 5000);
+            }
             else if (command == "scale" && parts.Length >= 3)
             {
                 double scale;
@@ -712,6 +1232,7 @@ namespace Oreo.TargetShieldHud
                     " | damage " + (weaponCore.CanReadDamage ? "ready" : "waiting") +
                     " | monitor " + (damageMonitorActive ? "on" : "off") +
                     " | DS " + (defenseShields.IsReady ? "ready" : "waiting") +
+                    " | Roach T3 " + (roachT3.IsLinked ? "linked" : "waiting") +
                     " | TextHUD " + (textHud.IsReady ? "ready" : "waiting"),
                     "White", 7000);
             }
@@ -778,8 +1299,8 @@ namespace Oreo.TargetShieldHud
             }
             else
             {
-                Notify("/oshield [on|off] | bars [on|off|min|full] | resetdamage | " +
-                    "pos X Y | scale N | api | record | top | save | export | " +
+                Notify("/oshield [on|off] | bars [on|off|min|full] | names [on|off] | resetdamage | " +
+                    "pos X Y | resetpos | scale N | api | record | top | save | export | " +
                     "cleardata confirm",
                     "White", 10000);
             }
@@ -795,7 +1316,7 @@ namespace Oreo.TargetShieldHud
 
         private double EnemyBarScale()
         {
-            return Math.Max(0.35, Math.Min(0.85, records.Scale * 0.68));
+            return Math.Max(0.30, Math.Min(0.70, records.Scale * 0.55));
         }
 
         private static double ClampPercent(double percent)
@@ -880,12 +1401,35 @@ namespace Oreo.TargetShieldHud
                 : metres.ToString("0", CultureInfo.InvariantCulture) + " m";
         }
 
+        private static string FormatDuration(double seconds)
+        {
+            if (double.IsNaN(seconds) || double.IsInfinity(seconds) || seconds < 0)
+                return "--";
+            if (seconds < 1) return "<1s";
+            if (seconds < 60) return Math.Ceiling(seconds).ToString("0",
+                CultureInfo.InvariantCulture) + "s";
+            if (seconds < 3600)
+            {
+                int total = (int)Math.Ceiling(seconds);
+                return (total / 60).ToString(CultureInfo.InvariantCulture) + "m " +
+                    (total % 60).ToString(CultureInfo.InvariantCulture) + "s";
+            }
+            int minutes = (int)Math.Ceiling(seconds / 60d);
+            return (minutes / 60).ToString(CultureInfo.InvariantCulture) + "h " +
+                (minutes % 60).ToString(CultureInfo.InvariantCulture) + "m";
+        }
+
         private static string FormatNumber(double value)
         {
             if (value >= 1000000000) return (value / 1000000000d).ToString("0.##", CultureInfo.InvariantCulture) + "B";
             if (value >= 1000000) return (value / 1000000d).ToString("0.##", CultureInfo.InvariantCulture) + "M";
             if (value >= 1000) return (value / 1000d).ToString("0.##", CultureInfo.InvariantCulture) + "K";
             return value.ToString("0", CultureInfo.InvariantCulture);
+        }
+
+        private static string FormatT3(double value)
+        {
+            return value.ToString("#,##0.##", CultureInfo.InvariantCulture);
         }
 
         private static void Notify(string message, string color = "Green", int duration = 4000)
@@ -911,6 +1455,7 @@ namespace Oreo.TargetShieldHud
             public readonly StringBuilder Text = new StringBuilder(192);
             public HudText Line;
             public int LastSeenFrame;
+            public int TagCharacters = 8;
 
             public EnemyShieldBar(MyEntity entity)
             {
@@ -933,6 +1478,33 @@ namespace Oreo.TargetShieldHud
             public double Shield;
             public double Hull;
             public int LastSeenFrame;
+        }
+
+        private sealed class TargetHullRecord
+        {
+            public double CurrentHp;
+            public double MaximumHp;
+            public int LastScanFrame;
+            public bool Ready;
+        }
+
+        private sealed class PendingDamageBatch
+        {
+            public MyEntity Entity;
+            public double ShieldDamage;
+            public double HullDamage;
+            public int FirstFrame;
+        }
+
+        private sealed class DamagePopup
+        {
+            public MyEntity Entity;
+            public readonly StringBuilder Text = new StringBuilder(48);
+            public HudText Line;
+            public double Damage;
+            public bool ShieldDamage;
+            public int StartFrame;
+            public int Lane;
         }
     }
 }
