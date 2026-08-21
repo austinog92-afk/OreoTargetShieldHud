@@ -1,0 +1,15 @@
+<Project>
+  <PropertyGroup>
+    <!-- Portable lookup. Override with /p:Bin64="D:\\...\\SpaceEngineers\\Bin64"
+         or set the SPACE_ENGINEERS_BIN64 environment variable. -->
+    <Bin64 Condition="'$(Bin64)' == '' and '$(SPACE_ENGINEERS_BIN64)' != ''">$(SPACE_ENGINEERS_BIN64)</Bin64>
+    <Bin64 Condition="'$(Bin64)' == '' and Exists('D:\Games\steamapps\common\SpaceEngineers\Bin64\Sandbox.Common.dll')">D:\Games\steamapps\common\SpaceEngineers\Bin64</Bin64>
+    <Bin64 Condition="'$(Bin64)' == '' and Exists('F:\SteamLibrary\steamapps\common\SpaceEngineers\Bin64\Sandbox.Common.dll')">F:\SteamLibrary\steamapps\common\SpaceEngineers\Bin64</Bin64>
+    <Bin64 Condition="'$(Bin64)' == '' and Exists('$(registry:HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\Steam App 244850@InstallLocation)\Bin64\Sandbox.Common.dll')">$(registry:HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\Steam App 244850@InstallLocation)\Bin64</Bin64>
+    <Bin64 Condition="'$(Bin64)' == '' and Exists('C:\Program Files (x86)\Steam\steamapps\common\SpaceEngineers\Bin64\Sandbox.Common.dll')">C:\Program Files (x86)\Steam\steamapps\common\SpaceEngineers\Bin64</Bin64>
+  </PropertyGroup>
+  <Target Name="ValidateSpaceEngineersBin64" BeforeTargets="ResolveAssemblyReferences"
+          Condition="!Exists('$(Bin64)\Sandbox.Common.dll')">
+    <Error Text="Space Engineers Bin64 was not found. Build with /p:Bin64=&quot;D:\SteamLibrary\steamapps\common\SpaceEngineers\Bin64&quot; or set SPACE_ENGINEERS_BIN64." />
+  </Target>
+</Project>
