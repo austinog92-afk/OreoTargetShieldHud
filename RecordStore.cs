@@ -10,16 +10,19 @@ namespace Oreo.TargetShieldHud
     internal sealed class RecordStore
     {
         private const string FileName = "OreoTargetShieldHud.txt";
+        public const double DefaultX = -0.34;
+        public const double DefaultY = 0.82;
         public const string ExportFileName = "OreoTargetShieldHud-MaxShields.txt";
         private readonly Dictionary<string, double> highestMaxShield =
             new Dictionary<string, double>(StringComparer.OrdinalIgnoreCase);
 
         public bool Enabled = true;
-        public double X = -0.34;
-        public double Y = 0.82;
+        public double X = DefaultX;
+        public double Y = DefaultY;
         public double Scale = 0.78;
         public bool EnemyBars = true;
         public bool MinimalEnemyBars = true;
+        public bool ShowEnemyBarNames = false;
         public bool Dirty { get; private set; }
         public int Count { get { return highestMaxShield.Count; } }
 
@@ -44,6 +47,7 @@ namespace Oreo.TargetShieldHud
                             bool enabled;
                             bool enemyBars;
                             bool minimalEnemyBars;
+                            bool showEnemyBarNames;
                             double x;
                             double y;
                             double scale;
@@ -53,6 +57,7 @@ namespace Oreo.TargetShieldHud
                             if (double.TryParse(parts[4], NumberStyles.Float, CultureInfo.InvariantCulture, out scale)) Scale = scale;
                             if (parts.Length >= 6 && bool.TryParse(parts[5], out enemyBars)) EnemyBars = enemyBars;
                             if (parts.Length >= 7 && bool.TryParse(parts[6], out minimalEnemyBars)) MinimalEnemyBars = minimalEnemyBars;
+                            if (parts.Length >= 8 && bool.TryParse(parts[7], out showEnemyBarNames)) ShowEnemyBarNames = showEnemyBarNames;
                             continue;
                         }
 
@@ -142,6 +147,13 @@ namespace Oreo.TargetShieldHud
             Dirty = true;
         }
 
+        public void ResetPosition()
+        {
+            X = DefaultX;
+            Y = DefaultY;
+            Dirty = true;
+        }
+
         public void ForceSave()
         {
             Dirty = true;
@@ -159,7 +171,7 @@ namespace Oreo.TargetShieldHud
                     X.ToString("R", CultureInfo.InvariantCulture) + "|" +
                     Y.ToString("R", CultureInfo.InvariantCulture) + "|" +
                     Scale.ToString("R", CultureInfo.InvariantCulture) + "|" +
-                    EnemyBars + "|" + MinimalEnemyBars);
+                    EnemyBars + "|" + MinimalEnemyBars + "|" + ShowEnemyBarNames);
                 foreach (KeyValuePair<string, double> item in SortedRecords())
                     writer.WriteLine("NPC|" + Encode(item.Key) + "|" +
                         item.Value.ToString("R", CultureInfo.InvariantCulture));
@@ -215,18 +227,17 @@ namespace Oreo.TargetShieldHud
         {
             if (value.Equals(genericName, StringComparison.OrdinalIgnoreCase))
                 return true;
-            if (!value.StartsWith(genericName + " ", StringComparison.OrdinalIgnoreCase))
+            if (!value.StartsWith(genericName, StringComparison.OrdinalIgnoreCase))
                 return false;
 
-            string suffix = value.Substring(genericName.Length + 1);
-            if (suffix.Length == 0)
+            // Space Engineers can append a number, brackets, punctuation, or a
+            // mod-provided debris suffix to its default names. Treat any delimited
+            // continuation of the default name as unnamed debris, while allowing a
+            // genuinely different word such as "Large Gridship".
+            if (value.Length == genericName.Length)
                 return true;
-            for (int i = 0; i < suffix.Length; i++)
-            {
-                if (!char.IsDigit(suffix[i]))
-                    return false;
-            }
-            return true;
+            char separator = value[genericName.Length];
+            return !char.IsLetter(separator);
         }
 
         private static string Encode(string value)
